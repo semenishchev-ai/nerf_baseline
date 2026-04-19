@@ -1,0 +1,3 @@
+# ninja log v7
+0	18531	1776202825888832875	/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/raymarching/build/temp.linux-x86_64-cpython-310/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/raymarching/src/bindings.o	59ff629024d7be3c
+3	53766	1776202825891832889	/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/raymarching/build/temp.linux-x86_64-cpython-310/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/raymarching/src/raymarching.o	ed1a22f8a84bd35e

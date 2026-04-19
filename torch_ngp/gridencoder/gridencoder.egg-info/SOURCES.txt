@@ -1,0 +1,7 @@
+setup.py
+/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/gridencoder/src/bindings.cpp
+/home/a_semenishchev/VS/iter_2/experiments/baseline_torch_ngp/gridencoder/src/gridencoder.cu
+gridencoder.egg-info/PKG-INFO
+gridencoder.egg-info/SOURCES.txt
+gridencoder.egg-info/dependency_links.txt
+gridencoder.egg-info/top_level.txt
