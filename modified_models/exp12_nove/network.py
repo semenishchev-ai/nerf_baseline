@@ -1,18 +1,18 @@
 """
-new_model_v1: Merging winning modifications
-1. EXP-05: Enhanced MLP (wider layers 128, skip connections, GELU)
-2. EXP-06: Scale-Aware Weighting (anti-aliasing via level masking by distance)
+EXP-12: Normal-Oriented View Encoding (NOVE)
+Uses surface normals to calculate the reflection vector and use it as input to the color MLP.
+Rationale: Drastically improves the representation of specular highlights (reflections).
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 import os, sys
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _TORCH_NGP = os.path.join(_DIR, '..', '..', 'baseline_choice', 'torch_ngp')
 sys.path.insert(0, _TORCH_NGP)
+
 from encoding import get_encoder
 from activation import trunc_exp
 from nerf.renderer import NeRFRenderer
@@ -22,36 +22,27 @@ class NeRFNetwork(NeRFRenderer):
                  encoding="hashgrid",
                  encoding_dir="sphere_harmonics",
                  encoding_bg="hashgrid",
-                 num_layers=3,
-                 hidden_dim=128,
-                 geo_feat_dim=31,
-                 num_layers_color=4,
-                 hidden_dim_color=128,
+                 num_layers=2,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=3,
+                 hidden_dim_color=64,
                  num_layers_bg=2,
                  hidden_dim_bg=64,
                  bound=1,
                  **kwargs):
         super().__init__(bound, **kwargs)
+
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.geo_feat_dim = geo_feat_dim
+        
         self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
-        self.num_levels = self.encoder.num_levels
-        self.level_dim = self.encoder.level_dim
-        base_res = self.encoder.base_resolution
-        per_level_scale = self.encoder.per_level_scale
-        self.register_buffer(
-            'log_resolutions',
-            torch.tensor([math.log(base_res * per_level_scale ** l)
-                         for l in range(self.num_levels)])
-        )
-        self.tau = nn.Parameter(torch.tensor(1.0))
+
         sigma_net = []
         for l in range(num_layers):
             if l == 0:
                 in_dim = self.in_dim
-            elif l == num_layers - 2:
-                in_dim = hidden_dim + self.in_dim
             else:
                 in_dim = hidden_dim
             if l == num_layers - 1:
@@ -60,16 +51,18 @@ class NeRFNetwork(NeRFRenderer):
                 out_dim = hidden_dim
             sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
         self.sigma_net = nn.ModuleList(sigma_net)
+
         self.num_layers_color = num_layers_color
         self.hidden_dim_color = hidden_dim_color
         self.encoder_dir, self.in_dim_dir = get_encoder(encoding_dir)
-        self.color_input_dim = self.in_dim_dir + self.geo_feat_dim
+
+        # Reflection encoding input: reflection vector (3) + original dir (in_dim_dir) + geo_feat + dot product (1)
+        self.color_input_dim = self.in_dim_dir + self.geo_feat_dim + 3 + 1
+
         color_net = []
         for l in range(num_layers_color):
             if l == 0:
                 in_dim = self.color_input_dim
-            elif l == num_layers_color - 2:
-                in_dim = hidden_dim_color + self.color_input_dim
             else:
                 in_dim = hidden_dim_color
             if l == num_layers_color - 1:
@@ -78,6 +71,7 @@ class NeRFNetwork(NeRFRenderer):
                 out_dim = hidden_dim_color
             color_net.append(nn.Linear(in_dim, out_dim, bias=False))
         self.color_net = nn.ModuleList(color_net)
+
         if self.bg_radius > 0:
             self.num_layers_bg = num_layers_bg
             self.hidden_dim_bg = hidden_dim_bg
@@ -97,54 +91,39 @@ class NeRFNetwork(NeRFRenderer):
         else:
             self.bg_net = None
 
-    def _apply_scale_weights(self, encoded, x):
-        B = encoded.shape[0]
-        L = self.num_levels
-        C = self.level_dim
-        dist = torch.norm(x, dim=-1, keepdim=True)
-        log_scale = torch.log(dist.clamp(min=1e-4))
-        tau = self.tau.abs().clamp(min=0.1)
-        weights = torch.sigmoid((self.log_resolutions.unsqueeze(0) - log_scale) / tau)
-        encoded = encoded.view(B, L, C)
-        encoded = encoded * weights.unsqueeze(-1)
-        return encoded.view(B, L * C)
+    def _get_normal(self, x):
+        """Estimate normals via finite difference of density."""
+        with torch.no_grad():
+            epsilon = 0.005 
+            dx = torch.tensor([epsilon, 0, 0], device=x.device, dtype=x.dtype)
+            dy = torch.tensor([0, epsilon, 0], device=x.device, dtype=x.dtype)
+            dz = torch.tensor([0, 0, epsilon], device=x.device, dtype=x.dtype)
+            
+            s_x_p = self.density(x + dx)['sigma']
+            s_x_n = self.density(x - dx)['sigma']
+            s_y_p = self.density(x + dy)['sigma']
+            s_y_n = self.density(x - dy)['sigma']
+            s_z_p = self.density(x + dz)['sigma']
+            s_z_n = self.density(x - dz)['sigma']
+            
+            normal = torch.stack([s_x_p - s_x_n, s_y_p - s_y_n, s_z_p - s_z_n], dim=-1)
+            normal = -F.normalize(normal, dim=-1)
+        return normal
 
     def forward(self, x, d):
-        encoded = self.encoder(x, bound=self.bound)
-        x_normalized = x / self.bound
-        encoded = self._apply_scale_weights(encoded, x_normalized)
-        h = encoded
-        for l in range(self.num_layers):
-            if l == self.num_layers - 2:
-                h = torch.cat([h, encoded], dim=-1)
-            h = self.sigma_net[l](h)
-            if l != self.num_layers - 1:
-                h = F.gelu(h)
-        sigma = trunc_exp(h[..., 0])
-        geo_feat = h[..., 1:]
-        d = self.encoder_dir(d)
-        color_input = torch.cat([d, geo_feat], dim=-1)
-        h = color_input
-        for l in range(self.num_layers_color):
-            if l == self.num_layers_color - 2:
-                h = torch.cat([h, color_input], dim=-1)
-            h = self.color_net[l](h)
-            if l != self.num_layers_color - 1:
-                h = F.gelu(h)
-        color = torch.sigmoid(h)
+        density_outputs = self.density(x)
+        sigma = density_outputs['sigma']
+        geo_feat = density_outputs['geo_feat']
+        color = self.color(x, d, geo_feat=geo_feat)
         return sigma, color
 
     def density(self, x):
         encoded = self.encoder(x, bound=self.bound)
-        x_normalized = x / self.bound
-        encoded = self._apply_scale_weights(encoded, x_normalized)
         h = encoded
         for l in range(self.num_layers):
-            if l == self.num_layers - 2:
-                h = torch.cat([h, encoded], dim=-1)
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
-                h = F.gelu(h)
+                h = F.relu(h, inplace=True)
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
         return {'sigma': sigma, 'geo_feat': geo_feat}
@@ -167,16 +146,21 @@ class NeRFNetwork(NeRFRenderer):
             x = x[mask]
             d = d[mask]
             geo_feat = geo_feat[mask]
-        d = self.encoder_dir(d)
-        color_input = torch.cat([d, geo_feat], dim=-1)
-        h = color_input
+        
+        normal = self._get_normal(x)
+        
+        dot = torch.sum(d * normal, dim=-1, keepdim=True)
+        reflection = d - 2 * dot * normal
+        
+        d_enc = self.encoder_dir(d)
+        h = torch.cat([d_enc, geo_feat, reflection, dot], dim=-1)
+        
         for l in range(self.num_layers_color):
-            if l == self.num_layers_color - 2:
-                h = torch.cat([h, color_input], dim=-1)
             h = self.color_net[l](h)
             if l != self.num_layers_color - 1:
-                h = F.gelu(h)
+                h = F.relu(h, inplace=True)
         h = torch.sigmoid(h)
+        
         if mask is not None:
             rgbs[mask] = h.to(rgbs.dtype)
         else:
@@ -186,7 +170,6 @@ class NeRFNetwork(NeRFRenderer):
     def get_params(self, lr):
         params = [
             {'params': self.encoder.parameters(), 'lr': lr},
-            {'params': [self.tau], 'lr': lr * 0.1},
             {'params': self.sigma_net.parameters(), 'lr': lr},
             {'params': self.encoder_dir.parameters(), 'lr': lr},
             {'params': self.color_net.parameters(), 'lr': lr},

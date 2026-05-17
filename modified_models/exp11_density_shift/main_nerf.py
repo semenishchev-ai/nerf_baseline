@@ -1,6 +1,5 @@
 """
-EXP-06: Anti-Alias Weights — Entry Point
-Identical to baseline main_nerf.py but imports the modified network.
+EXP-11: Learnable Density Shift (LDS) — Entry Point
 """
 import os, sys
 
@@ -10,6 +9,7 @@ _TORCH_NGP = os.path.join(_BASELINE, 'torch_ngp')
 sys.path.insert(0, _TORCH_NGP)
 sys.path.insert(0, _BASELINE)
 sys.path.insert(0, _DIR)
+
 import torch
 import argparse
 import numpy as np
@@ -66,8 +66,8 @@ if __name__ == '__main__':
         opt.preload = True
     if opt.patch_size > 1:
         opt.error_map = False
-        assert opt.num_rays % (opt.patch_size ** 2) == 0
-    print(f"[new_model_v1] Combined Scale-Aware Weighting + Enhanced MLP")
+        assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
+    print(f"[EXP-11] Learnable Density Shift")
     print(opt)
     seed_everything(opt.seed)
     model = NeRFNetwork(
